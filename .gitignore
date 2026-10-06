@@ -1,2 +1,6 @@
 
 ml/data/
+reports/
+
+__pycache__/
+artifacts/
