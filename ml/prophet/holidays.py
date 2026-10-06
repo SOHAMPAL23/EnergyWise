@@ -1,21 +1,4 @@
-"""
-ml/prophet/holidays.py
-───────────────────────
-Germany Holiday Calendar Integration
 
-Adds German federal holidays to a Prophet model instance using Prophet's
-built-in country holiday support via the `holidays` library.
-
-Regional selection justification:
-  - The OPSD dataset target column is `DE_load_actual_entsoe_transparency`
-    which represents Germany's national electricity load.
-  - Germany (DE) is the correct holiday region.
-  - Federal-level holidays only are included (regional/state holidays excluded).
-  - This assumption is documented in the Model Card.
-
-IMPORTANT: Do NOT apply a holiday calendar from an arbitrary country.
-           The region must correspond to the dataset target region.
-"""
 
 import logging
 from typing import Dict, Any
