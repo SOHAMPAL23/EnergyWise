@@ -1,4 +1,4 @@
-"""
+﻿"""
 ml/evaluation/plots.py
 ───────────────────────
 Final Evaluation Visualization
@@ -70,14 +70,15 @@ def plot_final_evaluation(
     _plot_weekly_aggregated(test_df, final_preds, granularity, save)
     _plot_largest_errors(final_preds, granularity, save)
     _plot_error_distribution(final_preds, granularity, save)
+    _plot_error_periods(final_preds, granularity, save)
 
 
 def _plot_actual_vs_forecast(train_df, test_df, final_preds, split_info, granularity, save):
     """Full actual vs forecast plot with train/test boundary."""
     fig, ax = plt.subplots(figsize=(16, 6))
 
-    # Training history (last 180 days for context)
-    train_tail = train_df.tail(180) if granularity == "daily" else train_df.tail(52)
+    # Training history (last 365 days / 52 weeks for context)
+    train_tail = train_df.tail(365) if granularity == "daily" else train_df.tail(52)
     ax.plot(train_tail[DS_COL], train_tail[Y_COL], color=PALETTE["actual"],
             linewidth=1.0, alpha=0.5, label="Training Demand")
 
@@ -135,43 +136,31 @@ def _plot_uncertainty_zoom(final_preds, granularity, save):
 
 
 def _plot_weekly_aggregated(test_df, final_preds, granularity, save):
-    """Weekly-aggregated actual vs prophet comparison."""
+    """Weekly-aggregated (complete Mon–Sun weeks) actual vs all three models."""
+    from ml.evaluation.evaluation import weekly_aggregate
     if granularity == "weekly":
-        # Already weekly — skip further aggregation
-        fig, ax = plt.subplots(figsize=(14, 5))
-        ax.plot(final_preds[DS_COL], final_preds["actual"], color=PALETTE["actual"],
-                linewidth=1.5, label="Actual Weekly")
-        ax.plot(final_preds[DS_COL], final_preds["prophet_yhat"], color=PALETTE["prophet"],
-                linewidth=1.5, label="Prophet Forecast")
-        ax.set_title("Weekly Actual vs Prophet Forecast", fontsize=14, fontweight="bold")
-        ax.set_xlabel("Week Start")
-        ax.set_ylabel("Mean Load (MW)")
-        ax.legend()
-        ax.grid(True, color=PALETTE["grid"], linewidth=0.5)
-        plt.tight_layout()
-        _save_fig(fig, f"eval_03_weekly_comparison.png", save)
-        return
-
-    temp = final_preds.copy()
-    temp[DS_COL] = pd.to_datetime(temp[DS_COL])
-    temp = temp.set_index(DS_COL)
-    weekly_actual = temp["actual"].resample("W-MON").mean()
-    weekly_prophet = temp["prophet_yhat"].resample("W-MON").mean()
+        wk = final_preds[[DS_COL, "actual", "prophet_yhat", "naive_yhat", "snaive_yhat"]].copy()
+        fname = "eval_03_weekly_comparison.png"
+    else:
+        wk = weekly_aggregate(final_preds)
+        fname = f"eval_03_weekly_aggregated_{granularity}.png"
 
     fig, ax = plt.subplots(figsize=(14, 5))
-    ax.plot(weekly_actual.index, weekly_actual.values, color=PALETTE["actual"],
-            linewidth=1.5, marker="o", markersize=3, label="Actual (Weekly Mean)")
-    ax.plot(weekly_prophet.index, weekly_prophet.values, color=PALETTE["prophet"],
-            linewidth=1.5, marker="s", markersize=3, label="Prophet (Weekly Mean)")
-    ax.set_title("Weekly-Aggregated: Actual vs Prophet Forecast", fontsize=14, fontweight="bold", pad=12)
-    ax.set_xlabel("Week Start", fontsize=11)
-    ax.set_ylabel("Mean Load (MW)", fontsize=11)
+    ax.plot(wk[DS_COL], wk["actual"], color=PALETTE["actual"], linewidth=1.8, label="Actual (weekly mean)")
+    ax.plot(wk[DS_COL], wk["prophet_yhat"], color=PALETTE["prophet"], linewidth=1.6, label="Prophet")
+    ax.plot(wk[DS_COL], wk["snaive_yhat"], color=PALETTE["snaive"], linewidth=1.0, linestyle="-.",
+            alpha=0.8, label="Seasonal-Naive")
+    ax.plot(wk[DS_COL], wk["naive_yhat"], color=PALETTE["naive"], linewidth=1.0, linestyle="--",
+            alpha=0.8, label="Naive")
+    ax.set_title("Weekly-aggregated comparison on hold-out test (complete Mon–Sun weeks)",
+                 fontsize=14, fontweight="bold", pad=12)
+    ax.set_xlabel("Week start")
+    ax.set_ylabel("Mean load (MW)")
     ax.legend(fontsize=10)
     ax.grid(True, color=PALETTE["grid"], linewidth=0.5)
     ax.xaxis.set_major_formatter(mdates.DateFormatter("%Y-%m"))
     plt.tight_layout()
-    _save_fig(fig, f"eval_03_weekly_aggregated_{granularity}.png", save)
-
+    _save_fig(fig, fname, save)
 
 def _plot_largest_errors(final_preds, granularity, save):
     """Highlight the 20 largest absolute errors."""
@@ -228,3 +217,27 @@ def _save_fig(fig, filename, save):
         fig.savefig(fpath, dpi=FIG_DPI, bbox_inches="tight")
         logger.info("[EVAL PLOTS] Saved: %s", fpath)
     plt.close(fig)
+
+
+def _plot_error_periods(final_preds, granularity, save):
+    """Prophet vs Seasonal-Naive MAE per calendar month — shows WHEN the model fails."""
+    t = final_preds.copy()
+    t[DS_COL] = pd.to_datetime(t[DS_COL])
+    t["month"] = t[DS_COL].dt.to_period("M").astype(str)
+    g = t.groupby("month").agg(
+        prophet=("prophet_error", lambda e: float(np.mean(np.abs(e)))),
+        snaive=("snaive_error", lambda e: float(np.mean(np.abs(e)))),
+    )
+    fig, ax = plt.subplots(figsize=(14, 5))
+    x = np.arange(len(g))
+    ax.bar(x - 0.2, g["prophet"], width=0.4, color=PALETTE["prophet"], label="Prophet MAE")
+    ax.bar(x + 0.2, g["snaive"], width=0.4, color=PALETTE["snaive"], label="Seasonal-Naive MAE")
+    ax.set_xticks(x)
+    ax.set_xticklabels(g.index, rotation=60, ha="right", fontsize=8)
+    ax.set_ylabel("MAE (MW)")
+    ax.set_title(f"Error by period — {granularity.capitalize()} (hold-out test)",
+                 fontsize=14, fontweight="bold", pad=12)
+    ax.legend()
+    ax.grid(True, axis="y", color=PALETTE["grid"], linewidth=0.5)
+    plt.tight_layout()
+    _save_fig(fig, f"eval_06_error_periods_{granularity}.png", save)
