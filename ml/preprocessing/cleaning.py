@@ -107,6 +107,7 @@ def clean_raw_dataframe(
     # ── Step 5: Interpolate short missing demand gaps ─────────────────────
     n_null_before = int(df[target_col].isna().sum())
     if n_null_before > 0:
+        null_mask_before = df[target_col].isna()
         # Linear interpolation for runs ≤ max_interp_gap consecutive NaN
         df[target_col] = df[target_col].interpolate(
             method="linear", limit=max_interp_gap, limit_direction="forward"
@@ -115,6 +116,11 @@ def clean_raw_dataframe(
         n_filled = n_null_before - n_null_after
         cleaning_log["nulls_interpolated"] = n_filled
         cleaning_log["nulls_remaining"] = n_null_after
+        # Record exactly which hours were imputed so downstream audits can prove that
+        # no imputed value (which uses the NEXT valid observation) straddles the
+        # train/test boundary.
+        imputed_mask = null_mask_before & df[target_col].notna()
+        cleaning_log["imputed_timestamps"] = [str(t) for t in df.loc[imputed_mask, timestamp_col]]
         if n_filled > 0:
             logger.info(
                 "[CLEANING] Interpolated %d null value(s) (linear, max_gap=%d). "
@@ -124,6 +130,7 @@ def clean_raw_dataframe(
     else:
         cleaning_log["nulls_interpolated"] = 0
         cleaning_log["nulls_remaining"] = 0
+        cleaning_log["imputed_timestamps"] = []
         logger.info("[CLEANING] No null values to interpolate.")
 
     n_final = len(df)
