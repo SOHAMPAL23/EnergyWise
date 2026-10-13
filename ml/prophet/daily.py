@@ -1,4 +1,4 @@
-"""
+﻿"""
 ml/prophet/daily.py
 ────────────────────
 Daily Prophet Forecaster
@@ -38,7 +38,7 @@ from ml.configs.config import (
     LOG_LEVEL,
     make_output_dirs,
 )
-from ml.prophet.configuration import build_prophet_params
+from ml.prophet.builder import build_prophet_model, fit_model, predict_seeded
 from ml.prophet.holidays import add_holidays, get_holiday_metadata
 
 logging.basicConfig(level=LOG_LEVEL, format=LOG_FORMAT, datefmt=LOG_DATE_FORMAT)
@@ -68,23 +68,9 @@ def train_daily_prophet(
     """
     make_output_dirs()
 
-    # Determine yearly seasonality based on training data span
     n_years_train = (
         train_df[DS_COL].max() - train_df[DS_COL].min()
     ).days / 365.25
-    yearly_seasonality = n_years_train >= 2.0
-
-    # Build parameter dict
-    param_dict = build_prophet_params(params)
-    param_dict["yearly_seasonality"] = yearly_seasonality
-
-    logger.info("[PROPHET-DAILY] Training on %d daily records (%s → %s).",
-                len(train_df), train_df[DS_COL].min().date(), train_df[DS_COL].max().date())
-    logger.info("[PROPHET-DAILY] Parameters: %s", {
-        k: v for k, v in param_dict.items() if k != "_eda_df"
-    })
-    logger.info("[PROPHET-DAILY] Yearly seasonality: %s (%.1f years of training data).",
-                yearly_seasonality, n_years_train)
 
     # Suppress Prophet's internal cmdstanpy output
     import logging as _logging
@@ -92,33 +78,20 @@ def train_daily_prophet(
         _logging.getLogger("prophet").setLevel(_logging.ERROR)
         _logging.getLogger("cmdstanpy").setLevel(_logging.ERROR)
 
-    # Instantiate and configure model
-    model = Prophet(
-        changepoint_prior_scale=param_dict["changepoint_prior_scale"],
-        seasonality_prior_scale=param_dict["seasonality_prior_scale"],
-        holidays_prior_scale=param_dict["holidays_prior_scale"],
-        seasonality_mode=param_dict["seasonality_mode"],
-        yearly_seasonality=param_dict["yearly_seasonality"],
-        weekly_seasonality=param_dict["weekly_seasonality"],
-        daily_seasonality=param_dict["daily_seasonality"],
-        interval_width=param_dict["interval_width"],
-        n_changepoints=param_dict["n_changepoints"],
-        changepoint_range=param_dict["changepoint_range"],
-    )
+    # Same builder as CV/tuning -> what was validated is what is shipped
+    model, param_dict = build_prophet_model(params, "daily", train_df)
+    yearly_seasonality = param_dict["yearly_seasonality"]
 
-    # Add Germany holidays
-    add_holidays(model)
-
-    # Add monthly seasonality for intra-year billing and weather cycle dynamics
-    model.add_seasonality(name="monthly", period=30.5, fourier_order=5)
+    logger.info("[PROPHET-DAILY] Training on %d daily records (%s → %s).",
+                len(train_df), train_df[DS_COL].min().date(), train_df[DS_COL].max().date())
+    logger.info("[PROPHET-DAILY] Parameters: %s", param_dict)
 
     # Fit — ONLY on training data
     t0 = time.time()
-    model.fit(train_df[[DS_COL, Y_COL]])
+    fit_model(model, train_df)
     elapsed = round(time.time() - t0, 2)
 
     logger.info("[PROPHET-DAILY] Training complete in %.2f seconds.", elapsed)
-
     training_meta = {
         "model_id": MODEL_ID_DAILY,
         "model_version": MODEL_VERSION_DAILY,
@@ -153,7 +126,7 @@ def generate_forecast(
     Forecast DataFrame with [ds, yhat, yhat_lower, yhat_upper, trend,
     weekly, yearly, holidays, ...].
     """
-    forecast = model.predict(future_df[[DS_COL]])
+    forecast = predict_seeded(model, future_df)
     logger.info("[PROPHET-DAILY] Forecast generated for %d timestamps.", len(forecast))
     return forecast
 
