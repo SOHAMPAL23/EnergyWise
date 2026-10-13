@@ -1,23 +1,28 @@
 """
 ml/experiments/tracker.py
 ──────────────────────────
-Experiment Tracking
+Experiment Tracking — one record per CV fold AND one per configuration summary.
 
-Logs every experiment (CV fold, tuning trial, final model) with full metadata.
-All experiments are persisted to CSV and JSON for reproducibility.
+Required fields (per spec):
+    experiment_id, model_version, granularity, parameters,
+    training_range, validation_range, MAE, RMSE, timestamp
 
-Each experiment record contains:
-  experiment_id, model, granularity, dataset_version, region,
-  training_range, validation_range, hyperparameters, MAE, RMSE, timestamp
+Additional context fields: run_id, stage, config_id, fold_index, n_train, n_val,
+interval_coverage, dataset_version, region, seed.
+
+The log is APPEND-ONLY across runs (run_id separates them). Only CV/tuning
+experiments are written here; hold-out test metrics are NEVER stored in this
+file, so it can be audited as "validation-only".
 """
 
 import csv
+import hashlib
 import json
 import logging
 import uuid
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Dict, Optional
+from typing import Any, Dict, List, Optional
 
 from ml.configs.config import (
     EXPERIMENTS_REPORT_DIR,
@@ -30,99 +35,74 @@ from ml.configs.config import (
 logging.basicConfig(level=LOG_LEVEL, format=LOG_FORMAT, datefmt=LOG_DATE_FORMAT)
 logger = logging.getLogger(__name__)
 
-EXPERIMENT_LOG_CSV = EXPERIMENTS_REPORT_DIR / "experiment_results.csv"
-EXPERIMENT_LOG_JSON = EXPERIMENTS_REPORT_DIR / "experiment_results.json"
+EXPERIMENT_LOG_CSV = EXPERIMENTS_REPORT_DIR / "experiments.csv"
+EXPERIMENT_LOG_JSON = EXPERIMENTS_REPORT_DIR / "experiments.json"
 
-_EXPERIMENTS: list = []  # In-memory store for the current session
-
-
-def log_experiment(
-    experiment_id: str,
-    model: str,
-    granularity: str,
-    dataset_version: str,
-    region: str,
-    training_range: str,
-    validation_range: str,
-    hyperparameters: Dict[str, Any],
-    mae_val: float,
-    rmse_val: float,
-    notes: Optional[str] = None,
-) -> Dict[str, Any]:
-    """
-    Log an experiment and persist to disk.
-
-    Parameters
-    ----------
-    experiment_id    : Unique experiment identifier.
-    model            : Model name (e.g., "prophet", "naive").
-    granularity      : "daily" or "weekly".
-    dataset_version  : OPSD dataset version string.
-    region           : Country/region code (e.g., "DE").
-    training_range   : Human-readable training range string.
-    validation_range : Human-readable validation range string.
-    hyperparameters  : Dict of hyperparameter key-value pairs.
-    mae_val          : Mean Absolute Error (from actual predictions).
-    rmse_val         : Root Mean Squared Error.
-    notes            : Optional notes string.
-
-    Returns
-    -------
-    dict — The experiment record.
-    """
-    make_output_dirs()
-
-    record = {
-        "experiment_id": experiment_id,
-        "run_timestamp": datetime.utcnow().isoformat() + "Z",
-        "model": model,
-        "granularity": granularity,
-        "dataset_version": dataset_version,
-        "region": region,
-        "training_range": training_range,
-        "validation_range": validation_range,
-        "hyperparameters": json.dumps(hyperparameters, default=str),
-        "MAE": round(float(mae_val), 4),
-        "RMSE": round(float(rmse_val), 4),
-        "notes": notes or "",
-    }
-
-    _EXPERIMENTS.append(record)
-    _persist_to_csv(record)
-    _persist_to_json()
-
-    logger.info("[TRACKER] Logged experiment '%s': MAE=%.4f, RMSE=%.4f",
-                experiment_id, mae_val, rmse_val)
-
-    return record
+FIELDS = [
+    "experiment_id", "run_id", "stage", "config_id", "fold_index",
+    "model", "model_version", "granularity", "parameters",
+    "training_range", "validation_range", "n_train", "n_val",
+    "MAE", "RMSE", "interval_coverage",
+    "dataset_version", "region", "seed", "timestamp",
+]
 
 
-def _persist_to_csv(record: Dict[str, Any]):
-    """Append a single experiment record to the CSV log."""
-    EXPERIMENT_LOG_CSV.parent.mkdir(parents=True, exist_ok=True)
-    file_exists = EXPERIMENT_LOG_CSV.exists()
-    fieldnames = list(record.keys())
-    with open(EXPERIMENT_LOG_CSV, "a", newline="", encoding="utf-8") as fh:
-        writer = csv.DictWriter(fh, fieldnames=fieldnames)
-        if not file_exists:
-            writer.writeheader()
-        writer.writerow(record)
+def new_run_id(granularity: str) -> str:
+    return f"{granularity}-{datetime.now(timezone.utc):%Y%m%dT%H%M%SZ}-{uuid.uuid4().hex[:6]}"
 
 
-def _persist_to_json():
-    """Overwrite the JSON experiment log with the full in-memory list."""
-    EXPERIMENT_LOG_JSON.parent.mkdir(parents=True, exist_ok=True)
-    with open(EXPERIMENT_LOG_JSON, "w", encoding="utf-8") as fh:
-        json.dump(_EXPERIMENTS, fh, indent=2, default=str)
+def config_id(params: Dict[str, Any]) -> str:
+    """Stable short hash of a parameter dict (order independent)."""
+    blob = json.dumps(params, sort_keys=True, default=str).encode()
+    return "cfg-" + hashlib.sha1(blob).hexdigest()[:8]
 
 
-def load_experiments() -> list:
-    """Load all experiments from the CSV log."""
-    if not EXPERIMENT_LOG_CSV.exists():
+class ExperimentTracker:
+    """Buffers experiment records and flushes them to CSV + JSON."""
+
+    def __init__(self, csv_path: Path = None, json_path: Path = None):
+        self.csv_path = Path(csv_path or EXPERIMENT_LOG_CSV)
+        self.json_path = Path(json_path or EXPERIMENT_LOG_JSON)
+        self.records: List[Dict[str, Any]] = []
+
+    def log(self, **kw) -> Dict[str, Any]:
+        missing = [k for k in ("experiment_id", "model_version", "granularity", "parameters",
+                               "training_range", "validation_range", "MAE", "RMSE") if k not in kw]
+        if missing:
+            raise ValueError(f"Experiment record is missing required fields: {missing}")
+        rec = {k: kw.get(k) for k in FIELDS}
+        rec["model"] = kw.get("model", "prophet")
+        rec["parameters"] = json.dumps(kw["parameters"], sort_keys=True, default=str)
+        rec["MAE"] = round(float(kw["MAE"]), 4)
+        rec["RMSE"] = round(float(kw["RMSE"]), 4)
+        rec["timestamp"] = kw.get("timestamp") or datetime.now(timezone.utc).isoformat()
+        self.records.append(rec)
+        return rec
+
+    def flush(self) -> None:
+        """Append buffered records to CSV, then rewrite the JSON mirror from the CSV."""
+        make_output_dirs()
+        if self.records:
+            self.csv_path.parent.mkdir(parents=True, exist_ok=True)
+            exists = self.csv_path.exists() and self.csv_path.stat().st_size > 0
+            with open(self.csv_path, "a", newline="", encoding="utf-8") as fh:
+                w = csv.DictWriter(fh, fieldnames=FIELDS)
+                if not exists:
+                    w.writeheader()
+                w.writerows(self.records)
+            logger.info("[TRACKER] Appended %d experiment record(s) -> %s",
+                        len(self.records), self.csv_path)
+            self.records = []
+        if self.csv_path.exists():
+            with open(self.csv_path, encoding="utf-8") as fh:
+                rows = list(csv.DictReader(fh))
+            with open(self.json_path, "w", encoding="utf-8") as fh:
+                json.dump(rows, fh, indent=1)
+
+
+def load_experiments(csv_path: Path = None) -> List[Dict[str, str]]:
+    path = Path(csv_path or EXPERIMENT_LOG_CSV)
+    if not path.exists():
         return []
-    records = []
-    with open(EXPERIMENT_LOG_CSV, encoding="utf-8") as fh:
-        reader = csv.DictReader(fh)
-        for row in reader:
-            records.append(dict(row))
-    return records
+    with open(path, encoding="utf-8") as fh:
+        return list(csv.DictReader(fh))
