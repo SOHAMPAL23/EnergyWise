@@ -1,4 +1,4 @@
-"""
+﻿"""
 ml/prophet/weekly.py
 ─────────────────────
 Weekly Prophet Forecaster
@@ -32,7 +32,7 @@ from ml.configs.config import (
     LOG_LEVEL,
     make_output_dirs,
 )
-from ml.prophet.configuration import build_prophet_params
+from ml.prophet.builder import build_prophet_model, fit_model, predict_seeded
 from ml.prophet.holidays import add_holidays, get_holiday_metadata
 
 logging.basicConfig(level=LOG_LEVEL, format=LOG_FORMAT, datefmt=LOG_DATE_FORMAT)
@@ -62,40 +62,23 @@ def train_weekly_prophet(
     n_years_train = (
         train_df[DS_COL].max() - train_df[DS_COL].min()
     ).days / 365.25
-    yearly_seasonality = n_years_train >= 2.0
-
-    param_dict = build_prophet_params(params)
-    param_dict["yearly_seasonality"] = yearly_seasonality
-    param_dict["weekly_seasonality"] = False   # No sub-weekly pattern in weekly data
-
-    logger.info("[PROPHET-WEEKLY] Training on %d weekly records (%s → %s).",
-                len(train_df), train_df[DS_COL].min().date(), train_df[DS_COL].max().date())
 
     import logging as _logging
     if not verbose:
         _logging.getLogger("prophet").setLevel(_logging.ERROR)
         _logging.getLogger("cmdstanpy").setLevel(_logging.ERROR)
 
-    model = Prophet(
-        changepoint_prior_scale=param_dict["changepoint_prior_scale"],
-        seasonality_prior_scale=param_dict["seasonality_prior_scale"],
-        holidays_prior_scale=param_dict["holidays_prior_scale"],
-        seasonality_mode=param_dict["seasonality_mode"],
-        yearly_seasonality=param_dict["yearly_seasonality"],
-        weekly_seasonality=param_dict["weekly_seasonality"],
-        daily_seasonality=False,
-        interval_width=param_dict["interval_width"],
-        n_changepoints=param_dict["n_changepoints"],
-        changepoint_range=param_dict["changepoint_range"],
-    )
-    add_holidays(model)
+    model, param_dict = build_prophet_model(params, "weekly", train_df)
+    yearly_seasonality = param_dict["yearly_seasonality"]
+
+    logger.info("[PROPHET-WEEKLY] Training on %d weekly records (%s → %s).",
+                len(train_df), train_df[DS_COL].min().date(), train_df[DS_COL].max().date())
 
     t0 = time.time()
-    model.fit(train_df[[DS_COL, Y_COL]])
+    fit_model(model, train_df)
     elapsed = round(time.time() - t0, 2)
 
     logger.info("[PROPHET-WEEKLY] Training complete in %.2f seconds.", elapsed)
-
     training_meta = {
         "model_id": MODEL_ID_WEEKLY,
         "model_version": MODEL_VERSION_WEEKLY,
@@ -115,7 +98,7 @@ def train_weekly_prophet(
 
 def generate_weekly_forecast(model: Prophet, future_df: pd.DataFrame) -> pd.DataFrame:
     """Generate weekly forecast."""
-    forecast = model.predict(future_df[[DS_COL]])
+    forecast = predict_seeded(model, future_df)
     logger.info("[PROPHET-WEEKLY] Forecast generated for %d weeks.", len(forecast))
     return forecast
 
