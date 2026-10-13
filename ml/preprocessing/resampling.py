@@ -32,6 +32,8 @@ from ml.configs.config import (
     TARGET_COL_RAW,
     DAILY_FREQUENCY,
     WEEKLY_FREQUENCY,
+    MIN_HOURS_PER_DAY,
+    DAYS_PER_WEEK,
     DS_COL,
     Y_COL,
     LOG_FORMAT,
@@ -75,13 +77,24 @@ def resample_to_daily(
     temp = pd.Series(demand.values, index=ts, name=target_col)
     temp.index = pd.DatetimeIndex(temp.index)
 
-    # Resample to daily mean (skipna=True is the default: days with partial
-    # NaN coverage will still produce a mean from available hours)
+    # Resample to daily mean. A day is only valid when ALL MIN_HOURS_PER_DAY hourly
+    # observations are present; a partial day (e.g. the single 23:00 UTC hour that
+    # opens the OPSD file) would otherwise be reported as a "daily mean" of one hour.
     daily = temp.resample(DAILY_FREQUENCY).mean()
+    hours_per_day = temp.resample(DAILY_FREQUENCY).count()
+    incomplete = hours_per_day < MIN_HOURS_PER_DAY
+    n_incomplete = int(incomplete.sum())
+    if n_incomplete:
+        logger.warning(
+            "[RESAMPLE] %d incomplete day(s) (<%d valid hours) set to NaN and excluded: %s",
+            n_incomplete, MIN_HOURS_PER_DAY,
+            [str(d.date()) for d in daily.index[incomplete][:5]],
+        )
+        daily = daily.where(~incomplete)
 
     n_null = int(daily.isna().sum())
     logger.info(
-        "[RESAMPLE] Hourly → Daily: %d days (%s to %s). Null days: %d.",
+        "[RESAMPLE] Hourly → Daily: %d days (%s to %s). Null/incomplete days: %d.",
         len(daily), daily.index.min().date(), daily.index.max().date(), n_null,
     )
 
@@ -117,7 +130,21 @@ def resample_to_weekly(
     temp = daily_df.set_index(ds_col)[y_col].copy()
     temp.index = pd.DatetimeIndex(temp.index)
 
-    weekly = temp.resample(WEEKLY_FREQUENCY).mean()
+    # Monday-start weeks: bins are [Mon, next Mon) labelled by the Monday that
+    # opens the week. (pandas' default for W-MON is right-closed/right-labelled,
+    # i.e. weeks ENDING on Monday, which labels a week with a date after its data.)
+    weekly = temp.resample(WEEKLY_FREQUENCY, closed="left", label="left").mean()
+    days_per_week = temp.dropna().resample(WEEKLY_FREQUENCY, closed="left", label="left").count()
+    days_per_week = days_per_week.reindex(weekly.index).fillna(0)
+    incomplete = days_per_week < DAYS_PER_WEEK
+    n_incomplete = int(incomplete.sum())
+    if n_incomplete:
+        logger.warning(
+            "[RESAMPLE] %d incomplete week(s) (<%d valid days) excluded: %s",
+            n_incomplete, DAYS_PER_WEEK,
+            [str(d.date()) for d in weekly.index[incomplete][:5]],
+        )
+        weekly = weekly.where(~incomplete)
 
     n_null = int(weekly.isna().sum())
     logger.info(

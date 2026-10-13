@@ -120,7 +120,19 @@ def run_preprocessing_pipeline(
     logger.info("[PIPELINE]   Weekly : %d total | %d train | %d test", len(df_weekly), len(train_weekly), len(test_weekly))
     logger.info("[PIPELINE] ══════════════════════════════════════════════════════════════════════")
 
+    # ── Cross-granularity leakage guard ───────────────────────────────────
+    # The weekly model must not train on a week that contains any day belonging
+    # to the DAILY hold-out partition (otherwise the two granularities would
+    # disagree about what "untouched test data" means).
+    last_weekly_train_day = train_weekly[DS_COL].max() + pd.Timedelta(days=6)
+    if last_weekly_train_day >= split_daily.test_start:
+        raise AssertionError(
+            f"[LEAKAGE] Last weekly-train week ends {last_weekly_train_day.date()} which is "
+            f">= daily test start {split_daily.test_start.date()}."
+        )
+
     return {
+        "cleaning_log": df_clean.attrs.get("cleaning_log", {}),
         "df_daily": df_daily,
         "df_weekly": df_weekly,
         "train_daily": train_daily,
