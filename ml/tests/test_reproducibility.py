@@ -109,3 +109,15 @@ def test_reloaded_model_is_prophet_instance(reproducible_df, tmp_path):
     with open(model_path, "r") as fh:
         reloaded = model_from_json(fh.read())
     assert isinstance(reloaded, Prophet)
+
+
+# ─── Seeded determinism ────────────────────────────────────────────────────────
+
+def test_fit_and_predict_are_deterministic_given_seed(reproducible_df):
+    """Two independent fits + interval draws must agree exactly (point AND interval)."""
+    from ml.prophet.daily import train_daily_prophet, generate_forecast
+    train, test, _ = chronological_train_test_split(reproducible_df)
+    f1 = generate_forecast(train_daily_prophet(train)[0], test)
+    f2 = generate_forecast(train_daily_prophet(train)[0], test)
+    for col in ("yhat", "yhat_lower", "yhat_upper"):
+        np.testing.assert_allclose(f1[col].to_numpy(), f2[col].to_numpy(), rtol=0, atol=1e-6)
