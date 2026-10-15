@@ -157,3 +157,33 @@ def test_split_empty_df_raises():
     df = pd.DataFrame({DS_COL: [], Y_COL: []})
     with pytest.raises(ValueError, match="empty"):
         chronological_train_test_split(df)
+
+
+# ─── Completeness rules (partial periods must not become fake "means") ──────────
+
+def test_partial_first_day_is_excluded():
+    """OPSD starts at 23:00 UTC: a 1-hour 'day' must not be reported as a daily mean."""
+    ts = pd.date_range("2014-12-31 23:00", periods=1 + 24 * 3, freq="h", tz="UTC")
+    df = pd.DataFrame({TIMESTAMP_COL: ts, TARGET_COL_RAW: np.full(len(ts), 50000.0)})
+    daily = resample_to_daily(df)
+    assert pd.isna(daily.loc[daily[DS_COL] == pd.Timestamp("2014-12-31"), Y_COL]).all()
+    assert daily[Y_COL].notna().sum() == 3
+
+
+def test_weekly_weeks_start_monday_and_are_complete():
+    days = pd.date_range("2015-01-01", "2015-02-28", freq="D")        # starts Thursday
+    daily = pd.DataFrame({DS_COL: days, Y_COL: np.arange(len(days), dtype=float) + 1000})
+    weekly = resample_to_weekly(daily).dropna()
+    assert (weekly[DS_COL].dt.dayofweek == 0).all()                    # Monday labels
+    assert weekly[DS_COL].min() == pd.Timestamp("2015-01-05")          # first COMPLETE Mon–Sun week
+    assert weekly[DS_COL].max() + pd.Timedelta(days=6) <= days.max()   # no label beyond the data
+    first = daily[(daily[DS_COL] >= "2015-01-05") & (daily[DS_COL] <= "2015-01-11")][Y_COL].mean()
+    assert weekly[Y_COL].iloc[0] == pytest.approx(first)
+
+
+def test_cleaning_records_imputed_timestamps():
+    ts = pd.date_range("2015-01-01", periods=48, freq="h", tz="UTC")
+    vals = np.linspace(40000, 41000, 48)
+    vals[10] = np.nan
+    out = clean_raw_dataframe(pd.DataFrame({TIMESTAMP_COL: ts, TARGET_COL_RAW: vals}))
+    assert out.attrs["cleaning_log"]["imputed_timestamps"] == [str(ts[10])]
