@@ -159,3 +159,42 @@ def test_anomaly_deviation_correct():
     result = detect_anomalies(test_df, forecast_df, save=False)
     assert result["deviation"].iloc[0] == pytest.approx(30.0)
     assert result["deviation_magnitude"].iloc[0] == pytest.approx(30.0)
+
+
+# ─── Spec fields, asymmetric intervals, validation ─────────────────────────────
+
+def test_required_anomaly_fields_present():
+    """timestamp, actual demand, lower, upper, deviation magnitude, classification."""
+    test_df, forecast_df = make_test_forecast([100.0, 150.0, 50.0], [100.0] * 3, [80.0] * 3, [120.0] * 3)
+    r = detect_anomalies(test_df, forecast_df, save=False)
+    assert {"timestamp", "actual", "lower_bound", "upper_bound",
+            "deviation_magnitude", "classification"} <= set(r.columns)
+    assert list(r["classification"]) == ["NORMAL", "SPIKE_ANOMALY", "DROP_ANOMALY"]
+    assert list(r["breach_magnitude"]) == [0.0, 30.0, 30.0]
+    assert list(r["deviation_magnitude"]) == [0.0, 50.0, 50.0]
+
+
+def test_sensitivity_scales_each_side_of_interval():
+    test_df, forecast_df = make_test_forecast([100.0], [100.0], [90.0], [130.0])   # asymmetric
+    r = detect_anomalies(test_df, forecast_df, sensitivity=2.0, save=False)
+    assert r["lower_bound"].iloc[0] == pytest.approx(80.0)
+    assert r["upper_bound"].iloc[0] == pytest.approx(160.0)
+
+
+def test_sensitivity_boundary_flips_classification():
+    test_df, forecast_df = make_test_forecast([125.0], [100.0], [80.0], [120.0])
+    assert detect_anomalies(test_df, forecast_df, sensitivity=1.0, save=False)["classification"].iloc[0] == "SPIKE_ANOMALY"
+    assert detect_anomalies(test_df, forecast_df, sensitivity=1.5, save=False)["classification"].iloc[0] == "NORMAL"
+
+
+@pytest.mark.parametrize("bad", [0, -1, -0.5])
+def test_invalid_sensitivity_rejected(bad):
+    test_df, forecast_df = make_test_forecast([100.0], [100.0], [80.0], [120.0])
+    with pytest.raises(ValueError):
+        detect_anomalies(test_df, forecast_df, sensitivity=bad, save=False)
+
+
+def test_misaligned_forecast_rejected():
+    test_df, forecast_df = make_test_forecast([100.0, 100.0], [100.0] * 2, [80.0] * 2, [120.0] * 2)
+    with pytest.raises(ValueError):
+        detect_anomalies(test_df, forecast_df.iloc[:1], save=False)
