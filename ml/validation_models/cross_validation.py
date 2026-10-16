@@ -1,39 +1,37 @@
 """
 ml/validation_models/cross_validation.py
 ─────────────────────────────────────────
-Training-Only Time-Series Cross-Validation
+Training-only rolling-origin (expanding-window) cross-validation.
 
-Implements expanding-window cross-validation EXCLUSIVELY inside the training
-partition (first 70% of the series).
+    TRAINING PARTITION (first 70%)                      TEST (last 30%)
+    |------------------------------------------------|  |----------------| <- never seen
+    fold 1: [=== train ===][ val ]
+    fold 2: [====== train =====][ val ]
+    fold k: [============ train ============][ val ]
 
-CRITICAL INVARIANT:
-  The test set (last 30%) MUST NEVER appear inside any CV fold.
-  Any code that passes test data into a CV fold violates this contract.
+* The training window ALWAYS starts at row 0 and grows with the origin
+  (expanding window).
+* Origins are anchored backwards from the END of the training partition and are
+  `step` rows apart; validation windows may overlap when step < horizon.
+* The function receives ONLY the training partition. If `holdout_start` is given it
+  additionally verifies that no row at/after the boundary is present, and an
+  AccessAuditor can be wrapped around the call to observe every dataframe that
+  reaches Prophet.
 
-CV structure (conceptual):
-  TRAINING PARTITION (70%)
-  ├── Fold 1: train=[0..t1], val=[t1..t1+H]
-  ├── Fold 2: train=[0..t2], val=[t2..t2+H]
-  └── Fold 3: train=[0..t3], val=[t3..t3+H]
+Each fold result: fold_index, train/val ranges, n_train, n_val, MAE, RMSE,
+interval_coverage, interval_ratio_q95 (see below), params, granularity.
 
-  TEST PARTITION (30%) — NEVER TOUCHED DURING CV
-
-For each fold and parameter configuration, records:
-  - fold index
-  - training range
-  - validation range
-  - parameters
-  - MAE
-  - RMSE
+`interval_ratio_q95` is the 95th percentile of |y - yhat| / (distance from yhat to
+the corresponding interval edge). A value of 1.0 means the nominal interval
+captured 95% of validation points; >1 means the interval is too narrow. It is
+training-only calibration evidence for the anomaly-detection sensitivity knob.
 """
 
 import logging
-from datetime import datetime
-from typing import Dict, Any, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 import numpy as np
 import pandas as pd
-from prophet import Prophet
 
 from ml.configs.config import (
     DS_COL,
@@ -41,147 +39,154 @@ from ml.configs.config import (
     CV_N_FOLDS,
     CV_VAL_HORIZON_DAYS,
     CV_MIN_TRAIN_DAYS,
+    CV_STEP_DAYS,
     CV_VAL_HORIZON_WEEKS,
     CV_MIN_TRAIN_WEEKS,
-    LOG_FORMAT,
-    LOG_DATE_FORMAT,
-    LOG_LEVEL,
-    HOLIDAY_COUNTRY,
+    CV_STEP_WEEKS,
+    RANDOM_SEED,
 )
 from ml.evaluation.metrics import mae, rmse
-from ml.prophet.configuration import build_prophet_params
-from ml.prophet.holidays import add_holidays
+from ml.prophet.builder import build_prophet_model, fit_model, predict_seeded
+from ml.validation_models.guard import assert_partition_before
 
-logging.basicConfig(level=LOG_LEVEL, format=LOG_FORMAT, datefmt=LOG_DATE_FORMAT)
 logger = logging.getLogger(__name__)
+
+
+def cv_defaults(granularity: str) -> Dict[str, int]:
+    if granularity == "weekly":
+        return dict(min_train=CV_MIN_TRAIN_WEEKS, horizon=CV_VAL_HORIZON_WEEKS, step=CV_STEP_WEEKS)
+    return dict(min_train=CV_MIN_TRAIN_DAYS, horizon=CV_VAL_HORIZON_DAYS, step=CV_STEP_DAYS)
+
+
+def make_rolling_origin_folds(
+    n_rows: int,
+    min_train: int,
+    horizon: int,
+    step: int,
+    n_folds: Optional[int] = None,
+) -> List[Tuple[int, int]]:
+    """
+    Return [(origin, val_end), ...] as row indices into the training partition.
+
+    train = rows[:origin]      (expanding window, starts at 0)
+    val   = rows[origin:val_end]   with val_end = origin + horizon <= n_rows
+
+    Origins are anchored backwards from n_rows - horizon so the most recent data
+    is always validated, then returned in chronological order.
+    """
+    if min_train < 1 or horizon < 1 or step < 1:
+        raise ValueError("min_train, horizon and step must all be >= 1")
+    if n_rows < min_train + horizon:
+        raise ValueError(
+            f"Training partition too small for CV: {n_rows} rows < min_train({min_train}) "
+            f"+ horizon({horizon})."
+        )
+    origins = []
+    o = n_rows - horizon
+    while o >= min_train:
+        origins.append(o)
+        o -= step
+    origins.reverse()
+    if n_folds is not None:
+        origins = origins[-int(n_folds):]
+    return [(o, o + horizon) for o in origins]
+
+
+def _fold_metrics(val_df: pd.DataFrame, forecast: pd.DataFrame) -> Dict[str, float]:
+    y = val_df[Y_COL].to_numpy(dtype=float)
+    yhat = forecast["yhat"].to_numpy(dtype=float)
+    lo = forecast["yhat_lower"].to_numpy(dtype=float)
+    hi = forecast["yhat_upper"].to_numpy(dtype=float)
+    cover = float(np.mean((y >= lo) & (y <= hi)))
+    side = np.where(y >= yhat, hi - yhat, yhat - lo)
+    ratio = np.abs(y - yhat) / np.maximum(side, 1e-9)
+    return {
+        "MAE": mae(y, yhat),
+        "RMSE": rmse(y, yhat),
+        "interval_coverage": cover,
+        "interval_ratio_q95": float(np.quantile(ratio, 0.95)),
+    }
+
+
+def run_cv(
+    train_df: pd.DataFrame,
+    params: Dict[str, Any],
+    granularity: str = "daily",
+    folds: Optional[List[Tuple[int, int]]] = None,
+    holdout_start: Optional[pd.Timestamp] = None,
+    seed: int = RANDOM_SEED,
+) -> List[Dict[str, Any]]:
+    """
+    Evaluate ONE parameter configuration across rolling-origin folds.
+
+    train_df       : TRAINING partition only (ds, y), chronologically sorted.
+    holdout_start  : first timestamp of the hold-out test set. If supplied, the
+                     function raises LeakageError if train_df reaches it.
+    folds          : precomputed [(origin, val_end)]; default derives from config.
+    """
+    if holdout_start is not None:
+        assert_partition_before(train_df, holdout_start, "CV input")
+    if not train_df[DS_COL].is_monotonic_increasing:
+        raise ValueError("train_df must be sorted by ds ascending")
+
+    if folds is None:
+        folds = make_rolling_origin_folds(len(train_df), n_folds=CV_N_FOLDS, **cv_defaults(granularity))
+
+    import logging as _log
+    _log.getLogger("prophet").setLevel(_log.ERROR)
+    _log.getLogger("cmdstanpy").setLevel(_log.ERROR)
+
+    results: List[Dict[str, Any]] = []
+    for i, (origin, val_end) in enumerate(folds, start=1):
+        fold_train = train_df.iloc[:origin]
+        fold_val = train_df.iloc[origin:val_end]
+        assert fold_train[DS_COL].max() < fold_val[DS_COL].min(), (
+            f"[CV LEAKAGE] fold {i}: train max {fold_train[DS_COL].max()} >= val min "
+            f"{fold_val[DS_COL].min()}"
+        )
+        assert val_end <= len(train_df)
+
+        model, _ = build_prophet_model(params, granularity, fold_train)
+        fit_model(model, fold_train, seed=seed)
+        forecast = predict_seeded(model, fold_val, seed=seed)
+        m = _fold_metrics(fold_val, forecast)
+
+        results.append({
+            "fold_index": i,
+            "train_start": str(fold_train[DS_COL].min().date()),
+            "train_end": str(fold_train[DS_COL].max().date()),
+            "val_start": str(fold_val[DS_COL].min().date()),
+            "val_end": str(fold_val[DS_COL].max().date()),
+            "n_train": int(len(fold_train)),
+            "n_val": int(len(fold_val)),
+            "MAE": round(m["MAE"], 4),
+            "RMSE": round(m["RMSE"], 4),
+            "interval_coverage": round(m["interval_coverage"], 4),
+            "interval_ratio_q95": round(m["interval_ratio_q95"], 4),
+            "params": dict(params),
+            "granularity": granularity,
+        })
+    return results
 
 
 def expanding_window_cv(
     train_df: pd.DataFrame,
     params: Dict[str, Any],
-    n_folds: int = CV_N_FOLDS,
-    val_horizon: int = None,
-    min_train_size: int = None,
+    n_folds: Optional[int] = None,
+    val_horizon: Optional[int] = None,
+    min_train_size: Optional[int] = None,
     granularity: str = "daily",
+    step: Optional[int] = None,
+    holdout_start: Optional[pd.Timestamp] = None,
 ) -> List[Dict[str, Any]]:
-    """
-    Expanding-window cross-validation on the training partition ONLY.
-
-    Parameters
-    ----------
-    train_df       : Training DataFrame (ds, y) — FIRST 70% ONLY.
-    params         : Prophet hyperparameters to evaluate.
-    n_folds        : Number of expanding-window folds.
-    val_horizon    : Validation horizon in rows (days or weeks).
-    min_train_size : Minimum training rows before first fold.
-    granularity    : "daily" or "weekly" — used for logging.
-
-    Returns
-    -------
-    List of fold result dicts, each with:
-      fold_index, train_start, train_end, val_start, val_end, MAE, RMSE, params
-    """
-    if min_train_size is None:
-        min_train_size = CV_MIN_TRAIN_WEEKS if granularity == "weekly" else CV_MIN_TRAIN_DAYS
-    if val_horizon is None or val_horizon == CV_VAL_HORIZON_DAYS and granularity == "weekly":
-        val_horizon = CV_VAL_HORIZON_WEEKS if granularity == "weekly" else CV_VAL_HORIZON_DAYS
-
-    n_total = len(train_df)
-    logger.info("[CV] Starting expanding-window CV: %d folds, horizon=%d rows, "
-                "total_train_rows=%d, granularity=%s.",
-                n_folds, val_horizon, n_total, granularity)
-
-    # Validate there is enough training data for CV
-    required_min = min_train_size + n_folds * val_horizon
-    if n_total < required_min:
-        logger.warning(
-            "[CV] Training set has %d rows but CV requires ~%d rows. "
-            "Reducing val_horizon to %d.",
-            n_total, required_min, max(1, (n_total - min_train_size) // n_folds),
-        )
-        val_horizon = max(1, (n_total - min_train_size) // n_folds)
-
-    # Suppress Prophet internal logging during CV
-    import logging as _log
-    _log.getLogger("prophet").setLevel(_log.ERROR)
-    _log.getLogger("cmdstanpy").setLevel(_log.ERROR)
-
-    fold_results: List[Dict[str, Any]] = []
-
-    for fold_idx in range(n_folds):
-        # Expanding window: each fold adds `val_horizon` more training rows
-        val_end_idx = n_total - (n_folds - fold_idx - 1) * val_horizon
-        val_start_idx = val_end_idx - val_horizon
-        train_end_idx = val_start_idx  # training ends just before validation
-
-        if train_end_idx < min_train_size:
-            logger.warning("[CV] Fold %d: insufficient training rows (%d < %d). Skipping.",
-                           fold_idx + 1, train_end_idx, min_train_size)
-            continue
-
-        fold_train = train_df.iloc[:train_end_idx].copy()
-        fold_val = train_df.iloc[val_start_idx:val_end_idx].copy()
-
-        # CRITICAL CHECK: Validate no overlap and that val is entirely within training partition
-        fold_train_max = fold_train[DS_COL].max()
-        fold_val_min = fold_val[DS_COL].min()
-        assert fold_train_max < fold_val_min, (
-            f"[CV LEAKAGE] Fold {fold_idx + 1}: fold_train_max ({fold_train_max}) "
-            f">= fold_val_min ({fold_val_min}). CV is leaking!"
-        )
-
-        # Build and train model
-        param_dict = build_prophet_params(params)
-        n_years_fold = (fold_train[DS_COL].max() - fold_train[DS_COL].min()).days / 365.25
-        yearly = n_years_fold >= 2.0
-
-        model = Prophet(
-            changepoint_prior_scale=param_dict["changepoint_prior_scale"],
-            seasonality_prior_scale=param_dict["seasonality_prior_scale"],
-            holidays_prior_scale=param_dict["holidays_prior_scale"],
-            seasonality_mode=param_dict["seasonality_mode"],
-            yearly_seasonality=yearly,
-            weekly_seasonality=True if granularity == "daily" else False,
-            daily_seasonality=False,
-            interval_width=param_dict["interval_width"],
-            n_changepoints=param_dict["n_changepoints"],
-            changepoint_range=param_dict["changepoint_range"],
-        )
-        add_holidays(model)
-        if granularity == "daily":
-            model.add_seasonality(name="monthly", period=30.5, fourier_order=5)
-        model.fit(fold_train[[DS_COL, Y_COL]])
-
-        # Predict on validation fold
-        val_forecast = model.predict(fold_val[[DS_COL]])
-        y_true = fold_val[Y_COL].values
-        y_pred = val_forecast["yhat"].values
-
-        fold_mae = mae(y_true, y_pred)
-        fold_rmse = rmse(y_true, y_pred)
-
-        fold_result = {
-            "fold_index": fold_idx + 1,
-            "train_start": str(fold_train[DS_COL].min().date()),
-            "train_end": str(fold_train[DS_COL].max().date()),
-            "val_start": str(fold_val[DS_COL].min().date()),
-            "val_end": str(fold_val[DS_COL].max().date()),
-            "n_train": len(fold_train),
-            "n_val": len(fold_val),
-            "MAE": round(fold_mae, 4),
-            "RMSE": round(fold_rmse, 4),
-            "params": {k: v for k, v in params.items()},
-            "granularity": granularity,
-        }
-        fold_results.append(fold_result)
-
-        logger.info(
-            "[CV] Fold %d/%d: train=%d rows (%s→%s) | val=%d rows (%s→%s) | "
-            "MAE=%.2f | RMSE=%.2f",
-            fold_idx + 1, n_folds,
-            len(fold_train), fold_train[DS_COL].min().date(), fold_train[DS_COL].max().date(),
-            len(fold_val), fold_val[DS_COL].min().date(), fold_val[DS_COL].max().date(),
-            fold_mae, fold_rmse,
-        )
-
-    return fold_results
+    """Backwards-compatible wrapper around make_rolling_origin_folds + run_cv."""
+    d = cv_defaults(granularity)
+    horizon = val_horizon or d["horizon"]
+    folds = make_rolling_origin_folds(
+        len(train_df),
+        min_train=min_train_size or d["min_train"],
+        horizon=horizon,
+        step=step or horizon,       # non-overlapping by default for this legacy entry point
+        n_folds=n_folds,
+    )
+    return run_cv(train_df, params, granularity, folds=folds, holdout_start=holdout_start)

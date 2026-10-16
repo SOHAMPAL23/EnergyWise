@@ -1,6 +1,29 @@
 
+# Data & reports (large / generated)
 ml/data/
 reports/
 
+# Build artefacts & caches
 __pycache__/
-artifacts/
+*.pyc
+*.pyo
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# ML artifacts (large binary files)
+ml/artifacts/
+
+# Environment / secrets — NEVER commit these
+.env
+.env.local
+.env.*.local
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# IDE
+.vscode/
+.idea/
