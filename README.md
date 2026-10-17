@@ -1,399 +1,143 @@
-# ⚡ EnergyWise: Explainable Energy Demand Forecasting & Decision-Support System
+# EnergyWise — Energy Demand Forecasting (OPSD Germany, Prophet)
 
-<p align="center">
-  <img src="https://img.shields.io/badge/Python-3.10%2B-blue?style=for-the-badge&logo=python&logoColor=white" alt="Python Version" />
-  <img src="https://img.shields.io/badge/Prophet-1.1.5-brightgreen?style=for-the-badge&logo=facebook&logoColor=white" alt="Prophet" />
-  <img src="https://img.shields.io/badge/FastAPI-0.104%2B-009688?style=for-the-badge&logo=fastapi&logoColor=white" alt="FastAPI" />
-  <img src="https://img.shields.io/badge/Dataset-OPSD%20Germany-orange?style=for-the-badge&logo=open-access&logoColor=white" alt="OPSD" />
-  <img src="https://img.shields.io/badge/Validation-Zero%20Data%20Leakage-success?style=for-the-badge" alt="Zero Leakage" />
-  <img src="https://img.shields.io/badge/License-MIT-purple?style=for-the-badge" alt="License" />
-</p>
+Leakage-safe forecasting pipeline for German hourly electricity load (Open Power System Data),
+with daily and weekly Prophet models, Naive / Seasonal-Naive baselines, training-only
+time-series cross-validation, hyperparameter tuning, prediction-interval anomaly signals,
+versioned artifacts and an evidence-based audit.
 
----
+> Every number below is copied from files produced by `python -m ml.pipeline --task all`
+> (`reports/evaluation/final_metrics_*.json`, `ml/artifacts/metadata/tuning_*.json`).
+> Re-run the pipeline to regenerate them. Do not edit them by hand.
 
-## 📌 Executive Overview
+## Data
 
-Modern electrical power grids operate in real-time equilibrium where electricity generation must match consumer and industrial demand every millisecond. Accurate power demand forecasting is mission-critical for:
-- **Grid Stability & Frequency Control**: Mitigating blackouts and frequency excursions.
-- **Economic Dispatch & Spinning Reserve Optimization**: Sizing fast-ramping peaker plants versus base-load generation.
-- **Renewable Curtailment Prevention**: Integrating non-dispatchable wind and solar while maintaining capacity reserves.
-- **Trading & Day-Ahead Settlement**: Enabling utility operators to hedge spot-market price volatility.
+| | |
+|---|---|
+| Source | OPSD *Time series* 2020-10-06, column `DE_load_actual_entsoe_transparency` (ENTSO-E) |
+| Raw | 50,401 hourly rows, 2014-12-31 23:00 UTC → 2020-09-30 23:00 UTC |
+| Unit | **MW** (mean load over the period). Not GWh. |
+| Daily series | 2,100 complete days, 2015-01-01 → 2020-09-30 (the 1-hour partial day 2014-12-31 is excluded) |
+| Weekly series | 299 complete Monday–Sunday weeks, 2015-01-05 → 2020-09-21 |
+| Raw file SHA-256 | `6a7f2bc571314cbf9c321cc03437691cd4be95c3a6f075e60ff99e8035c704c8` |
 
-**EnergyWise** is an end-to-end, production-oriented energy demand forecasting and operational decision-support platform. Built on **12 years of continuous daily electricity consumption data** (2006–2017) from the **Open Power System Data (OPSD)** repository for Germany, EnergyWise integrates rigorous time-series preprocessing, zero-data-leakage chronological validation, decomposable Bayesian modeling via **Prophet**, dual-baseline benchmarking, automated 95% uncertainty interval anomaly detection, and modular REST API infrastructure.
+The raw CSV is git-ignored (130 MB). Download it from
+`https://data.open-power-system-data.org/time_series/2020-10-06/time_series_60min_singleindex.csv`
+into `ml/data/opsd-time_series-2020-10-06/opsd-time_series-2020-10-06/` and verify the hash.
 
----
+## Split — 70 % train / 30 % test, chronological
 
-## 🌟 Key Highlights & Engineering Principles
+| | Daily | Weekly |
+|---|---|---|
+| Train | 1,470 days, 2015-01-01 → 2019-01-09 | 209 weeks, 2015-01-05 → 2018-12-31 |
+| Test (untouched) | 630 days, 2019-01-10 → 2020-09-30 | 90 weeks, 2019-01-07 → 2020-09-21 |
 
-- **Zero-Leakage Chronological Validation**: Strict 70/30 temporal split (3,068 train days vs. 1,315 holdout test days). The test set remains strictly isolated until final scoring; all cross-validation and hyperparameter search operates exclusively via expanding windows within the training partition.
-- **Decomposable & Explainable Modeling**: Incorporates secular piecewise linear trend with changepoint detection, 7-day Fourier weekly seasonality, 365.25-day annual seasonality, and national German public holiday calendars (`DE`).
-- **Probabilistic Anomaly Detection**: Generates 95% Bayesian uncertainty bounds ($[\hat{y}_{\text{lower}}, \hat{y}_{\text{upper}}]$) to classify demand anomalies in real-time (`SPIKE_ANOMALY` vs. `DROP_ANOMALY` vs. `NORMAL`).
-- **Dual Baseline Verification**: Models are rigorously benchmarked against persistence (**Naive**) and periodic recurrence (**Seasonal-Naive**) baselines.
-- **Production-Ready Artifacts**: Models and preprocessed datasets are exported with cryptographic hashes (SHA-256) and standard serialization for instant loading into FastAPI microservices.
+The test period contains the **2020 COVID-19 demand shock**.
 
----
+## Leakage controls
 
-## 🏗️ System Architecture
+1. **`HoldoutVault`** (`ml/validation_models/guard.py`) wraps the test partition. EDA, CV, tuning and final
+   fitting only receive training frames; the vault opens only for `final_evaluation`, logs every access and is
+   SHA-256 fingerprinted before/after.
+2. **`AccessAuditor`** wraps `Prophet.fit/predict` and records the date range of every frame the model sees; it
+   raises if any row at/after the test boundary arrives. Tuning observed 560 fits + 560 predictions per
+   granularity, max date touched = last training day.
+3. **Counterfactual test** (`ml/tests/test_cv_leakage.py`, `ml/audit.py`): all test values are replaced by
+   noise, the split → CV → tuning chain is re-run, and every fold metric and the selected parameters are
+   bit-identical.
+4. EDA runs on the training partition only.
 
-```
-                                  [ Open Power System Data (OPSD) ]
-                                                │
-                                                ▼
-                                    [ Ingestion & Profiling ]
-                                (Dynamic detection, SHA-256 Hash)
-                                                │
-                                                ▼
-                                   [ 4 Data Quality Gates ]
-                          (Schema, Monotonicity, Zero-Dupe, Continuity)
-                                                │
-                                                ▼
-                                  [ Preprocessing & Resampling ]
-                             (Daily Prophet `ds`/`y`, Weekly `W-MON`)
-                                                │
-                                                ▼
-                     ┌─────────────────────────────────────────────────────┐
-                     │     Strict Chronological 70% / 30% Temporal Split   │
-                     │  Train: 2006-01-01 to 2014-05-26 (3,068 days)      │
-                     │  Holdout: 2014-05-27 to 2017-12-31 (1,315 days)    │
-                     └──────────────────────────┬──────────────────────────┘
-                                                │
-                 ┌──────────────────────────────┴──────────────────────────────┐
-                 ▼                                                             ▼
-    [ Baseline Models ]                                          [ Primary Model Training ]
-  • Naive Persistence                                         • Expanding-Window CV (3 Folds)
-  • Seasonal-Naive (7-day cycle)                              • German Holiday Calendar (`DE`)
-                 │                                            • Bayesian Uncertainty (95%)
-                 │                                                             │
-                 └──────────────────────────────┬──────────────────────────────┘
-                                                │
-                                                ▼
-                               [ Model Evaluation & Benchmarks ]
-                             (MAE, RMSE, MAPE, 95% Coverage)
-                                                │
-                                                ▼
-                             [ Explainable Decomposition & Anomaly ]
-                          • Trend, Weekly & Yearly Seasonality, Holidays
-                          • 95% Interval Dynamic Outlier Classification
-                                                │
-                                                ▼
-                             [ Serialized Production Artifacts ]
-                                (`prophet_daily_v1.json`)
-                                                │
-                                                ▼
-                                     [ FastAPI REST Backend ]
-                                  • GET  /api/v1/forecast
-                                  • GET  /api/v1/anomalies
-                                  • GET  /api/v1/components
-                                  • POST /api/v1/retrain
-                                                │
-                                                ▼
-                               [ Operator Decision Dashboard ]
-```
+## Cross-validation and tuning (training partition only)
 
----
+* Rolling-origin / expanding window: train window always starts at row 0; 7 folds; daily: min train 730 d,
+  horizon 180 d, step 90 d; weekly: 104 / 26 / 13 weeks.
+* Grid (frozen before tuning): `changepoint_prior_scale` ∈ {0.005, 0.01, 0.05, 0.1, 0.5} × `seasonality_prior_scale` ∈ {1, 10}
+  × `holidays_prior_scale` ∈ {1, 10} × (`n_changepoints`, `changepoint_range`) ∈ {(25,.8), (25,.9), (10,.8), (40,.8)} = 80 configs.
+* Selection: lowest mean validation MAE (tie → RMSE). Every fold of every config is logged to
+  `reports/experiments/experiments.{csv,json}` with `experiment_id, model_version, granularity, parameters,
+  training_range, validation_range, MAE, RMSE, timestamp` (+ run_id, config_id, fold, coverage, seed).
 
-## 📊 Dataset Specification & Quality Gates
+| Granularity | Selected parameters | CV MAE (default → tuned) | CV RMSE (tuned) |
+|---|---|---:|---:|
+| Daily | cps 0.005, sps 10, hps 1, 25 cp, range 0.9 | 1,830.5 → 1,398.2 | 1,916.1 |
+| Weekly | cps 0.01, sps 1, hps 1, 10 cp, range 0.8 | 1,765.9 → 1,502.8 | 1,970.0 |
 
-The primary data stream is sourced from the **Open Power System Data (OPSD)** platform representing primary grid consumption in Germany (`DE`).
+The daily optimum sits at the lower edge of the `changepoint_prior_scale` grid (0.005).
 
-| Attribute | Specification |
-| :--- | :--- |
-| **Source** | Open Power System Data (Platform for Power System Data in Europe) |
-| **Geographic Region** | Federal Republic of Germany (DE) national grid |
-| **Temporal Coverage** | `2006-01-01` to `2017-12-31` (12 consecutive years) |
-| **Observation Frequency** | Daily (`D`), aggregated from hourly grid telemetry |
-| **Total Observations** | **4,383 days** (continuous time-series) |
-| **Target Variable** | `y` (Electricity Consumption in **Gigawatt-hours (GWh)**) |
-| **Mean Daily Demand** | `1,338.68 GWh` (Standard Deviation: `165.78 GWh`) |
-| **Demand Extremes** | Minimum: `842.40 GWh` \| Maximum: `1,709.57 GWh` |
+## Hold-out results (fixed-origin forecast of the entire test period; no refitting)
 
-### Automated 4-Tier Quality Validation Pipeline
+**Daily (630 days)**
 
-Before any modeling or transformations, all data passes through 4 non-negotiable validation gates implemented in [`ml/energy_demand_forecasting_pipeline.ipynb`](file:///c:/Users/Soham/OneDrive/Desktop/Energy%20Demand%20Forecasting/ml/energy_demand_forecasting_pipeline.ipynb):
+| Model | MAE (MW) | RMSE (MW) |
+|---|---:|---:|
+| Naive | 12,228.5 | 13,965.8 |
+| Seasonal-naive (7 d) | 6,152.3 | 7,508.9 |
+| **Prophet** | **3,239.6** | **4,051.1** |
 
-1. **Schema & Dtype Integrity**: Guarantees timestamp and numeric consumption exist with strictly positive non-null floats.
-2. **Temporal Monotonicity**: Verifies strictly increasing date sequences ($\Delta t > 0$).
-3. **Duplicate Resolution**: Enforces zero duplicate rows and zero duplicate timestamps.
-4. **Continuity & Gap Detection**: Asserts zero missing days over the entire 4,383-day historical span ($\text{len}(\text{date\_range}) = \text{len}(\text{series})$).
+Weekly-aggregated daily forecasts (89 complete weeks): Prophet MAE 3,159.8 / RMSE 3,837.4; Seasonal-naive 5,879.3 / 6,981.1; Naive 12,268.5 / 12,978.2.
 
----
+**Weekly (90 weeks)**
 
-## 🔬 Mathematical Formulation & Modeling Strategy
+| Model | MAE (MW) | RMSE (MW) |
+|---|---:|---:|
+| Naive | 3,649.7 | 4,382.4 |
+| **Seasonal-naive (52 w)** | **2,524.2** | **3,199.2** |
+| Prophet | 3,142.7 | 3,857.8 |
 
-### 1. The Prophet Additive Decomposition Model
-Energy demand exhibits pronounced multiple seasonalities combined with structural economic transitions. The core model is formulated as:
+**Weekly Prophet does not beat the 52-week seasonal-naive baseline.**
 
-$$y(t) = g(t) + s_w(t) + s_a(t) + h(t) + \epsilon_t$$
+Interval calibration: nominal 95 % → empirical test coverage **60.8 %** (daily) and **48.9 %** (weekly). Worst months for
+Prophet are April–July and September 2020 (mean error ≈ −4,300 … −7,000 MW, i.e. the model over-forecasts demand
+during the COVID-19 slump). See `reports/evaluation/evaluation_report_*.md`.
 
-Where:
-- **$g(t)$ — Trend Function**: Piecewise linear growth modeling long-term economic changes, energy efficiency measures, and industrial output fluctuations. Changepoints are automatically selected with prior $\tau = 0.10$.
-- **$s_w(t)$ — Weekly Seasonality**: Fourier representation capturing the stark contrast between high industrial weekday consumption and suppressed weekend demand.
-- **$s_a(t)$ — Yearly Seasonality**: Annual cycle driven by meteorological variables (winter lighting/heating surges versus summer troughs).
-- **$h(t)$ — National Holiday Component**: Modeled indicator functions representing German federal holidays (`DE`), capturing demand slumps during Christmas, New Year's Day, Easter, and German Unity Day.
-- **$\epsilon_t \sim \mathcal{N}(0, \sigma^2)$**: Normally distributed idiosyncratic disturbance.
+## Anomaly signals
 
-### 2. Dual Baseline Forecasters
+`actual < lower → DROP_ANOMALY`, `actual > upper → SPIKE_ANOMALY`, otherwise `NORMAL`, with
+`lower = ŷ − s·(ŷ − ŷ_lower)`, `upper = ŷ + s·(ŷ_upper − ŷ)`; `s` = `--sensitivity` (default 1.0 = raw 95 % interval).
+Each record carries timestamp, actual demand, lower/upper bound, deviation magnitude and classification.
 
-To provide honest, statistically sound performance baselines, EnergyWise implements:
+At s = 1.0: daily 247 drops / 0 spikes (39.2 % of days); weekly 45 drops / 1 spike. These flags are
+**investigation signals, not ground truth**: no labelled anomalies exist (so no precision/recall is reported) and the
+alert rate is dominated by forecast drift over a 630-day fixed-origin horizon and COVID-19.
 
-- **Naive Persistence Baseline**: Predicts the last observed training value across the entire horizon:
-  $$\hat{y}_{t+h} = y_T$$
-- **Seasonal-Naive (7-day Cycle) Baseline**: Projects the observed value from the corresponding day of the preceding 7-day cycle:
-  $$\hat{y}_{t+h} = y_{T - 7 + (h \bmod 7)}$$
+## Artifacts (`ml/artifacts/`, git-ignored)
 
----
+* `models/prophet-{daily,weekly}-v2.json` + `.meta.json` (training range, params, holidays, changepoints, tuning
+  reference, data hash, seed, environment, git commit — no test metrics)
+* `metrics/final_metrics_*.json`, `metrics/anomaly_summary_*.json`
+* `forecasts/final_predictions_*.csv`, `anomaly_detections_*.csv`, `anomalies_*.json`
+* `metadata/tuning_*.json`, `manifest.json` (SHA-256 of every file; consumers should read this first)
+* `*-v1*` / `prophet_daily_v1.json` are **stale** (pre-fix) — do not consume.
 
-## 📈 Empirical Benchmarks & Performance Results
+## Run
 
-All models were evaluated on the **1,315-day holdout test partition** (`2014-05-27` to `2017-12-31`).
-
-| Model Architecture | MAE (GWh) | RMSE (GWh) | MAPE (%) | 95% Coverage | Purpose & Strengths |
-| :--- | :---: | :---: | :---: | :---: | :--- |
-| **Naive Baseline** | `128.89` | `168.61` | `10.20%` | — | Minimal reference; captures no seasonality or trend. |
-| **Seasonal-Naive (7-day)** | `77.83` | `104.57` | `5.67%` | — | Strong benchmark for short-term 7-day recurring cycles. |
-| **Prophet Primary Forecaster** | `120.87` | `146.41` | `9.03%` | **98.86%** | **Decomposable, multi-year horizon, holiday shocks, and probabilistic uncertainty bounds.** |
-
-### Key Analytical Takeaways
-1. **Explainable Long-Term Horizon vs. Short-Term Persistence**: While Seasonal-Naive exploits strong short-lag 7-day autocorrelation, it lacks any capacity for calendar shift handling, holiday shock estimation, or long-range horizon expansion.
-2. **Superior Uncertainty Estimation**: Prophet achieves **98.86% empirical coverage** on the 95% Bayesian prediction interval over 1,315 unseen holdout days, demonstrating calibrated uncertainty estimation vital for grid risk management.
-3. **Interpretability**: Prophet provides granular component attribution (trend, week, year, holidays) required by regulatory energy bodies and transmission system operators (TSOs).
-
----
-
-## 🔍 Explainable Decomposition & Operational Anomaly Detection
-
-### Component Attribution
-1. **Secular Trend ($g(t)$)**: Models the gradual structural transition in German energy consumption, accounting for post-2008 industrial recovery and subsequent energy efficiency policies.
-2. **Weekly Seasonality ($s_w(t)$)**:
-   - **Weekdays (Mon–Fri)**: Surge to ~1,450 – 1,530 GWh/day driven by commercial and manufacturing operations.
-   - **Weekends (Sat–Sun)**: Drops to ~1,100 – 1,220 GWh/day (~20–25% reduction).
-3. **Yearly Seasonality ($s_a(t)$)**:
-   - **Winter Peak (Jan–Feb)**: Reaches seasonal high (>1,550 GWh/day) due to short daylight hours, commercial lighting, and resistive heating.
-   - **Summer Trough (June–August)**: Lowest annual consumption (~1,200 GWh/day).
-4. **Holiday Shocks ($h(t)$)**:
-   - German Unity Day (*Tag der Deutschen Einheit*), Christmas Eve/Day, and New Year's Day produce immediate, quantifiable drops of **200 to 350+ GWh/day**.
-
-### Anomaly Classification Logic
-
-Using the calibrated 95% uncertainty interval:
-
-```
-                  ┌────────────────────────────────────────────────────────┐
-                  │ Actual Demand vs. 95% Bayesian Prediction Interval     │
-                  └────────────────────────────────────────────────────────┘
-                                              │
-                      ┌───────────────────────┴───────────────────────┐
-                      ▼                                               ▼
-         y_t > yhat_upper_t                             y_t < yhat_lower_t
-                 │                                               │
-                 ▼                                               ▼
-     🚨 [ SPIKE_ANOMALY ]                            ⚠️ [ DROP_ANOMALY ]
-   • Extreme heatwave (A/C load)                   • Major industrial blackout
-   • Unplanned industrial surge                    • Unscheduled factory shutdowns
-   • Transmission grid rerouting                   • Severe weather event disruption
-```
-
-- **Test Horizon Anomaly Breakdown (1,315 days)**:
-  - **Normal Operation**: **1,300 days (98.86%)**
-  - **Drop Anomalies**: **15 days (1.14%)** (capturing extreme holiday clusters and post-storm industrial curtailment)
-  - **Spike Anomalies**: **0 days (0.00%)**
-
----
-
-## 📂 Repository File Tree
-
-```
-EnergyWise/
-├── README.md                                    # Comprehensive system documentation
-├── requirements.txt                             # Production & development dependencies
-├── ml/                                          # Core Machine Learning & Data Science engine
-│   ├── energy_demand_forecasting_pipeline.ipynb # End-to-end reproducible research notebook
-│   ├── data/
-│   │   ├── raw/                                 # Raw downloaded OPSD time-series
-│   │   ├── processed/                           # Quality-cleansed time-series data
-│   │   │   ├── daily_demand.csv                 # 4,383 days (ds, y)
-│   │   │   └── weekly_demand.csv                # Aggregated weekly demand (W-MON)
-│   │   └── metadata/                            # Data dictionary & provenance logs
-│   └── artifacts/                               # Exported models & metrics
-│       ├── models/
-│       │   └── prophet_daily_v1.json            # Serialized Prophet model binary
-│       ├── metrics/                             # JSON evaluation benchmark outputs
-│       ├── metadata/                            # Training configuration & hashes
-│       └── forecasts/                           # Exported forecast CSVs with uncertainty
-```
-
----
-
-## 🚀 Quick Start Guide
-
-### Prerequisites
-- **Python 3.10+**
-- **Git**
-
-### 1. Clone the Repository
-```bash
-git clone https://github.com/SOHAMPAL23/EnergyWise.git
-cd EnergyWise
-```
-
-### 2. Set Up Virtual Environment
-```bash
-# On Linux / macOS:
-python3 -m venv .venv
-source .venv/bin/activate
-
-# On Windows (PowerShell):
-python -m venv .venv
-.venv\Scripts\Activate.ps1
-```
-
-### 3. Install Dependencies
-```bash
-pip install --upgrade pip
+```powershell
 pip install -r requirements.txt
+python -m ml.pipeline --task all                 # ~7 min: profile → validate → preprocess → EDA → tune → train → evaluate
+python -m ml.pipeline --task audit               # evidence-based audit → reports/audit/ml_pipeline_audit.md
+python -m ml.pipeline --task anomalies --sensitivity 1.5
+python -m pytest                                 # unit + leakage tests
 ```
 
-### 4. Run the ML Pipeline Notebook
-Launch Jupyter Notebook or VS Code to run all cells interactively:
-```bash
-jupyter notebook ml/energy_demand_forecasting_pipeline.ipynb
-```
-
-### 5. Load the Serialized Model in Python
 ```python
-import pandas as pd
 from prophet.serialize import model_from_json
-
-# Load pre-trained model artifact
-with open("ml/artifacts/models/prophet_daily_v1.json", "r", encoding="utf-8") as f:
-    model = model_from_json(f.read())
-
-# Generate future 30-day forecast
-future = model.make_future_dataframe(periods=30, freq="D")
-forecast = model.predict(future)
-
-# Inspect predictions and uncertainty bounds
-print(forecast[["ds", "yhat", "yhat_lower", "yhat_upper"]].tail())
+m = model_from_json(open("ml/artifacts/models/prophet-daily-v2.json", encoding="utf-8").read())
+future = m.make_future_dataframe(periods=30, freq="D")
+m.predict(future)[["ds", "yhat", "yhat_lower", "yhat_upper"]].tail()
 ```
 
----
+## Limitations
 
-## 📡 REST API Specification (FastAPI Architecture)
+* National German holidays only; no weather regressors (planned).
+* COVID-19 lies in the test window; no 2015–2019 model can anticipate it.
+* Prophet intervals are under-dispersed here (see coverage); do not present them as calibrated 95 % probabilities.
+* FastAPI backend / dashboard are **not implemented** in this repository yet.
 
-The system includes pre-configured schemas for deployment via FastAPI:
+## Audit
 
-### Core Endpoints
+`reports/audit/ml_pipeline_audit.md` lists PASS / WARNING / FAIL for the 20 pipeline requirements, the
+test-leakage proof, and the fixes required before the backend consumes the artifacts.
 
-#### 1. `GET /api/v1/health`
-Health check and model load status.
-- **Response**: `{"status": "healthy", "model_version": "prophet_daily_v1", "loaded": true}`
+## References
 
-#### 2. `POST /api/v1/forecast`
-Generate $H$-step future demand forecasts with uncertainty bounds.
-- **Request Body**:
-  ```json
-  {
-    "horizon_days": 14,
-    "interval_width": 0.95
-  }
-  ```
-- **Response**:
-  ```json
-  {
-    "forecast": [
-      {
-        "date": "2018-01-01",
-        "predicted_demand_gwh": 1184.23,
-        "lower_bound_gwh": 1052.18,
-        "upper_bound_gwh": 1318.45
-      }
-    ]
-  }
-  ```
-
-#### 3. `POST /api/v1/anomalies/detect`
-Ingest recent telemetry and detect load anomalies against Bayesian bounds.
-- **Request Body**:
-  ```json
-  {
-    "observations": [
-      {"date": "2018-01-01", "demand_gwh": 920.4}
-    ]
-  }
-  ```
-- **Response**:
-  ```json
-  {
-    "results": [
-      {
-        "date": "2018-01-01",
-        "demand_gwh": 920.4,
-        "expected_gwh": 1184.23,
-        "classification": "DROP_ANOMALY",
-        "severity": "CRITICAL"
-      }
-    ]
-  }
-  ```
-
-#### 4. `GET /api/v1/components`
-Extract Fourier terms, trend changepoint dates, and holiday shock coefficients.
-
----
-
-## 🧪 Testing & Code Quality
-
-EnergyWise includes automated validation tests covering data integrity, zero-leakage constraints, and anomaly classification:
-
-```bash
-# Run test suite
-pytest tests/ -v
-
-# Check formatting and linting
-ruff check .
-black --check .
-```
-
-Included unit tests verify:
-- Data leakage prevention: `max(train_ds) < min(test_ds)`.
-- Correct categorization of `NORMAL`, `SPIKE_ANOMALY`, and `DROP_ANOMALY`.
-- Robust round-trip serialization/deserialization of Prophet models.
-
----
-
-## 🗺️ Roadmap & Future Enhancements
-
-- [x] Complete Exploratory Data Analysis & Resampling Pipeline
-- [x] Zero-Leakage 70/30 Chronological Split with Unit Tests
-- [x] Dual-Baseline Benchmarking (Naive & Seasonal-Naive)
-- [x] Prophet Model Optimization with German Holiday Calendar
-- [x] 95% Bayesian Prediction Interval Anomaly Detection
-- [ ] Exogenous Meteorological Regressors (Temperature, Wind speed, Solar irradiance)
-- [ ] Deep Learning Benchmarks (Temporal Fusion Transformers, N-BEATS, PatchTST)
-- [ ] FastAPI Microservice & OpenAPI Interactive Documentation
-- [ ] React 18 + Vite Decision Support Dashboard with Tailwind CSS & Recharts
-- [ ] Automated Continuous Retraining Pipeline with GitHub Actions / Airflow
-
----
-
-## 📚 References & Data Citations
-
-1. **Open Power System Data (OPSD)**:
-   *Open Power System Data. 2020. Data Package Time series. Version 2020-10-06.*
-   https://data.open-power-system-data.org/time_series/
-2. **Prophet Forecasting Model**:
-   *Taylor, S. J., & Letham, B. (2018). Forecasting at scale. The American Statistician, 72(1), 37-45.*
-   https://doi.org/10.1080/00031305.2017.1380080
-
----
-
-## 📄 License
-
-This project is licensed under the **MIT License** — see the [LICENSE](LICENSE) file for details.
-
----
-
-<p align="center">
-  <b>Developed for Grid Operators, Energy Analysts, and Machine Learning Practitioners.</b><br>
-  Built with ❤️ by <a href="https://github.com/SOHAMPAL23">Soham Pal</a>
-</p>
+Open Power System Data, *Time series* 2020-10-06, https://data.open-power-system-data.org/time_series/ ·
+Taylor & Letham (2018), *Forecasting at scale*, The American Statistician 72(1).
