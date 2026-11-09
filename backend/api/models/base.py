@@ -21,12 +21,15 @@ class Base(DeclarativeBase):
 
 def _build_engine():
     settings = get_settings()
-    return create_engine(
-        settings.DATABASE_URL,
-        echo=settings.DB_ECHO_SQL,
-        pool_pre_ping=True,   # detect stale connections before using them
-        future=True,
-    )
+    engine_kwargs = {
+        "echo": settings.DB_ECHO_SQL,
+        "future": True,
+    }
+    if "sqlite" in settings.DATABASE_URL.lower():
+        engine_kwargs["connect_args"] = {"check_same_thread": False}
+    else:
+        engine_kwargs["pool_pre_ping"] = True   # detect stale connections before using them
+    return create_engine(settings.DATABASE_URL, **engine_kwargs)
 
 
 # Module-level singletons (lazy-initialised on first import)
@@ -50,3 +53,12 @@ def get_session_factory():
             autoflush=False,
         )
     return _SessionLocal
+
+
+def reset_db_engine() -> None:
+    """Reset cached engine and session factory (primarily for testing)."""
+    global _engine, _SessionLocal
+    if _engine is not None:
+        _engine.dispose()
+    _engine = None
+    _SessionLocal = None
