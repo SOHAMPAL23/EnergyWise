@@ -14,9 +14,11 @@ Responsibilities
 
 import logging
 import sys
+import time
+import uuid
 from contextlib import asynccontextmanager
 from pathlib import Path
-from typing import AsyncGenerator
+from typing import Any, AsyncGenerator, Dict
 
 # Ensure backend directory is in sys.path
 _backend_dir = Path(__file__).resolve().parent
@@ -24,9 +26,10 @@ if str(_backend_dir) not in sys.path:
     sys.path.insert(0, str(_backend_dir))
 
 import uvicorn
-from fastapi import FastAPI, Request, status
+from fastapi import FastAPI, HTTPException, Request, status
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
+from starlette.exceptions import HTTPException as StarletteHTTPException
 
 from api.core.config import get_settings
 from api.core.exceptions import EnergyWiseError
@@ -101,6 +104,17 @@ def create_app() -> FastAPI:
         allow_headers=["*"],
     )
 
+    # ── Observability Middleware ──────────────────────────────────────────────
+    @app.middleware("http")
+    async def add_process_time_and_request_id(request: Request, call_next):
+        req_id = request.headers.get("X-Request-ID", str(uuid.uuid4()))
+        start_time = time.perf_counter()
+        response = await call_next(request)
+        process_time = time.perf_counter() - start_time
+        response.headers["X-Process-Time"] = f"{process_time:.4f}s"
+        response.headers["X-Request-ID"] = req_id
+        return response
+
     # ── Global exception handlers ─────────────────────────────────────────────
     @app.exception_handler(EnergyWiseError)
     async def energywise_error_handler(
@@ -117,10 +131,28 @@ def create_app() -> FastAPI:
             content={"detail": exc.detail, "type": type(exc).__name__},
         )
 
+    @app.exception_handler(StarletteHTTPException)
+    async def http_exception_handler(
+        request: Request, exc: StarletteHTTPException
+    ) -> JSONResponse:
+        headers = getattr(exc, "headers", None)
+        return JSONResponse(
+            status_code=exc.status_code,
+            content={"detail": exc.detail},
+            headers=headers,
+        )
+
     @app.exception_handler(Exception)
     async def unhandled_error_handler(
         request: Request, exc: Exception
     ) -> JSONResponse:
+        if isinstance(exc, (HTTPException, StarletteHTTPException)):
+            headers = getattr(exc, "headers", None)
+            return JSONResponse(
+                status_code=exc.status_code,
+                content={"detail": exc.detail},
+                headers=headers,
+            )
         logger.exception(
             "Unhandled exception [%s %s]", request.method, request.url.path
         )
@@ -128,6 +160,36 @@ def create_app() -> FastAPI:
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             content={"detail": "An internal server error occurred."},
         )
+
+    # ── Root endpoints ────────────────────────────────────────────────────────
+    @app.get(
+        "/",
+        tags=["General"],
+        summary="Service information and links",
+        response_model=Dict[str, Any],
+    )
+    async def root() -> Dict[str, Any]:
+        """Root endpoint returning service identity, version, and links to documentation and APIs."""
+        return {
+            "service": settings.APP_NAME,
+            "version": settings.APP_VERSION,
+            "environment": settings.ENVIRONMENT,
+            "status": "online",
+            "docs_url": "/docs",
+            "redoc_url": "/redoc",
+            "health_url": f"{settings.API_V1_PREFIX}/health",
+            "forecast_url": f"{settings.API_V1_PREFIX}/forecast",
+        }
+
+    @app.get(
+        "/health",
+        tags=["Health"],
+        summary="Health check shortcut",
+        description="Alias for /api/v1/health commonly used by cloud load balancers and orchestrators.",
+    )
+    async def root_health() -> JSONResponse:
+        """Root shortcut to the standard health endpoint."""
+        return await health.health_check()
 
     # ── Routers ───────────────────────────────────────────────────────────────
     app.include_router(health.router, prefix=settings.API_V1_PREFIX)
