@@ -17,6 +17,7 @@ To make a route PUBLIC, simply omit the dependency.
 
 import hmac
 import logging
+from typing import Optional
 
 from fastapi import Header, HTTPException, status
 
@@ -26,8 +27,8 @@ logger = logging.getLogger(__name__)
 
 
 async def require_api_key(
-    x_api_key: str = Header(
-        ...,
+    x_api_key: Optional[str] = Header(
+        None,
         alias="X-API-Key",
         description="API key for service authentication.",
     ),
@@ -36,10 +37,18 @@ async def require_api_key(
     FastAPI dependency that validates the `X-API-Key` header.
 
     Returns the validated key string on success so downstream code can log it.
-    Raises HTTP 401 on failure.
+    Raises HTTP 401 on failure (missing or invalid key).
     """
     settings = get_settings()
     expected = settings.API_KEY
+
+    if not x_api_key:
+        logger.warning("Missing API key.")
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Invalid or missing API key.",
+            headers={"WWW-Authenticate": f'ApiKey realm="{settings.APP_NAME}"'},
+        )
 
     # Constant-time comparison prevents timing side-channels
     is_valid = hmac.compare_digest(x_api_key.encode(), expected.encode())
