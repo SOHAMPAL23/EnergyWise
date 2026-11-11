@@ -71,3 +71,50 @@ class ForecastItem(BaseModel):
 
 # Type alias for list of forecast items
 ForecastResponse = List[ForecastItem]
+
+
+class ForecastRequest(BaseModel):
+    """
+    JSON request body schema for POST /api/v1/forecast.
+    """
+    granularity: Literal["daily", "weekly"] = Field(
+        ...,
+        description="Forecast aggregation granularity ('daily' or 'weekly').",
+        examples=["daily"],
+    )
+    start_date: date = Field(
+        ...,
+        description="Inclusive start date of the forecast period (YYYY-MM-DD).",
+        examples=["2026-10-15"],
+    )
+    end_date: date = Field(
+        ...,
+        description="Inclusive end date of the forecast period (YYYY-MM-DD).",
+        examples=["2026-10-20"],
+    )
+
+    model_config = {
+        "json_schema_extra": {
+            "example": {
+                "granularity": "daily",
+                "start_date": "2026-10-15",
+                "end_date": "2026-10-20",
+            }
+        }
+    }
+
+
+class ForecastSummary(BaseModel):
+    """
+    Summary statistics for a generated forecast series.
+    """
+    model_config = {"protected_namespaces": ()}
+
+    granularity: Literal["daily", "weekly"] = Field(..., description="Forecast granularity")
+    start_date: str = Field(..., description="Start date of the interval")
+    end_date: str = Field(..., description="End date of the interval")
+    count: int = Field(..., description="Total forecast points generated")
+    mean_forecast_mw: float = Field(..., description="Mean forecast load in MW")
+    min_forecast_mw: float = Field(..., description="Minimum forecast load in MW")
+    max_forecast_mw: float = Field(..., description="Maximum forecast load in MW")
+    model_version: str = Field(..., description="Model version tag used")
