@@ -232,10 +232,12 @@ class ModelRegistry:
 
         Raises ModelNotAvailableError if not found.
         """
+        norm_rel = rel_path.replace("\\", "/")
         artifacts = self._manifest.get("artifacts", {})
         for entries in artifacts.values():
             for entry in entries:
-                if entry.get("path") == rel_path:
+                entry_path = entry.get("path", "").replace("\\", "/")
+                if entry_path == norm_rel:
                     return entry
         raise ModelNotAvailableError(
             f"Artifact '{rel_path}' not listed in manifest."
