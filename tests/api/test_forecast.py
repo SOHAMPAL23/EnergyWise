@@ -382,3 +382,73 @@ class TestForecastModelAvailabilityErrors:
         }
         res = client_missing_daily.get(self.ENDPOINT, params=params)
         assert res.status_code == 200
+
+
+class TestForecastPostEndpoint:
+    """Tests for POST /api/v1/forecast endpoint."""
+
+    ENDPOINT = "/api/v1/forecast"
+
+    def test_post_daily_forecast_returns_200(self, client: TestClient):
+        payload = {
+            "granularity": "daily",
+            "start_date": "2026-10-15",
+            "end_date": "2026-10-17",
+        }
+        res = client.post(self.ENDPOINT, json=payload)
+        assert res.status_code == 200
+        data = res.json()
+        assert len(data) == 3
+        assert data[0]["granularity"] == "daily"
+
+    def test_post_weekly_forecast_returns_200(self, client: TestClient):
+        payload = {
+            "granularity": "weekly",
+            "start_date": "2026-10-12",
+            "end_date": "2026-10-26",
+        }
+        res = client.post(self.ENDPOINT, json=payload)
+        assert res.status_code == 200
+        data = res.json()
+        assert len(data) >= 1
+        assert data[0]["granularity"] == "weekly"
+
+    def test_post_invalid_date_range_returns_422(self, client: TestClient):
+        payload = {
+            "granularity": "daily",
+            "start_date": "2026-10-20",
+            "end_date": "2026-10-15",
+        }
+        res = client.post(self.ENDPOINT, json=payload)
+        assert res.status_code == 422
+
+
+class TestForecastExtraEndpoints:
+    """Tests for /api/v1/forecast/summary and /api/v1/forecast/models."""
+
+    def test_forecast_summary_returns_stats(self, client: TestClient):
+        params = {
+            "granularity": "daily",
+            "start_date": "2026-10-15",
+            "end_date": "2026-10-17",
+        }
+        res = client.get("/api/v1/forecast/summary", params=params)
+        assert res.status_code == 200
+        data = res.json()
+        assert data["granularity"] == "daily"
+        assert data["count"] == 3
+        assert "mean_forecast_mw" in data
+        assert "min_forecast_mw" in data
+        assert "max_forecast_mw" in data
+        assert data["min_forecast_mw"] <= data["max_forecast_mw"]
+
+    def test_forecast_models_endpoint_lists_models(self, client: TestClient):
+        res = client.get("/api/v1/forecast/models")
+        assert res.status_code == 200
+        data = res.json()
+        assert "supported_granularities" in data
+        assert "models" in data
+        assert "daily" in data["models"]
+        assert "weekly" in data["models"]
+        assert data["models"]["daily"]["available"] is True
+
