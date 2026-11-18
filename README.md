@@ -118,12 +118,6 @@ python -m ml.pipeline --task anomalies --sensitivity 1.5
 python -m pytest                                 # unit + leakage tests
 ```
 
-```python
-from prophet.serialize import model_from_json
-m = model_from_json(open("ml/artifacts/models/prophet-daily-v2.json", encoding="utf-8").read())
-future = m.make_future_dataframe(periods=30, freq="D")
-m.predict(future)[["ds", "yhat", "yhat_lower", "yhat_upper"]].tail()
-```
 
 ## Limitations
 
@@ -137,7 +131,3 @@ m.predict(future)[["ds", "yhat", "yhat_lower", "yhat_upper"]].tail()
 `reports/audit/ml_pipeline_audit.md` lists PASS / WARNING / FAIL for the 20 pipeline requirements, the
 test-leakage proof, and the fixes required before the backend consumes the artifacts.
 
-## References
-
-Open Power System Data, *Time series* 2020-10-06, https://data.open-power-system-data.org/time_series/ ·
-Taylor & Letham (2018), *Forecasting at scale*, The American Statistician 72(1).
